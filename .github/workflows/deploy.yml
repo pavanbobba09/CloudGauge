@@ -1,0 +1,228 @@
+name: Deploy Cloud Cost Optimizer
+
+# Trigger the workflow on push to main branch
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+# Environment variables used across jobs
+env:
+  NODE_VERSION: '18'
+  AWS_REGION: 'us-east-1'
+
+jobs:
+  # Test job - runs tests for both frontend and backend
+  test:
+    runs-on: ubuntu-latest
+    
+    # Service containers for testing
+    services:
+      postgres:
+        image: postgres:14
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: cloud_optimizer_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+      
+      redis:
+        image: redis:7
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+
+    - name: Install root dependencies
+      run: npm install
+
+    - name: Install frontend dependencies
+      run: cd frontend && npm install
+
+    - name: Install backend dependencies
+      run: cd backend && npm install
+
+    - name: Run frontend tests
+      run: cd frontend && npm test -- --coverage --watchAll=false
+      env:
+        CI: true
+
+    - name: Run backend tests
+      run: cd backend && npm test -- --coverage --forceExit
+      env:
+        NODE_ENV: test
+        DATABASE_URL: postgresql://postgres:postgres@localhost:5432/cloud_optimizer_test
+        REDIS_URL: redis://localhost:6379/1
+        JWT_SECRET: test-jwt-secret-for-github-actions
+
+    - name: Upload frontend coverage reports
+      uses: codecov/codecov-action@v3
+      with:
+        directory: ./frontend/coverage
+        flags: frontend
+
+    - name: Upload backend coverage reports
+      uses: codecov/codecov-action@v3
+      with:
+        directory: ./backend/coverage
+        flags: backend
+
+  # Build job - builds the application
+  build:
+    runs-on: ubuntu-latest
+    needs: test
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+
+    - name: Install dependencies
+      run: npm run install:all
+
+    - name: Build frontend
+      run: npm run build:frontend
+      env:
+        VITE_API_URL: ${{ secrets.VITE_API_URL }}
+
+    - name: Build backend
+      run: npm run build:backend
+
+    - name: Create Lambda deployment package
+      run: |
+        cd backend
+        npm run lambda:package
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: build-artifacts
+        path: |
+          frontend/dist
+          backend/dist
+          backend/lambda-deployment.zip
+
+  # Deploy job - only runs on main branch pushes
+  deploy:
+    runs-on: ubuntu-latest
+    needs: [test, build]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Download build artifacts
+      uses: actions/download-artifact@v3
+      with:
+        name: build-artifacts
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: 1.6.0
+
+    - name: Terraform Init
+      run: |
+        cd terraform
+        terraform init
+
+    - name: Terraform Plan
+      run: |
+        cd terraform
+        terraform plan -var="environment=production" \
+                      -var="db_password=${{ secrets.DB_PASSWORD }}" \
+                      -var="redis_auth_token=${{ secrets.REDIS_AUTH_TOKEN }}"
+
+    - name: Terraform Apply
+      run: |
+        cd terraform
+        terraform apply -auto-approve \
+                        -var="environment=production" \
+                        -var="db_password=${{ secrets.DB_PASSWORD }}" \
+                        -var="redis_auth_token=${{ secrets.REDIS_AUTH_TOKEN }}"
+
+    - name: Update Lambda function
+      run: |
+        aws lambda update-function-code \
+          --function-name cloud-cost-optimizer-api \
+          --zip-file fileb://backend/lambda-deployment.zip
+
+    - name: Deploy frontend to S3 (if configured)
+      run: |
+        if [ -n "${{ secrets.S3_BUCKET_NAME }}" ]; then
+          aws s3 sync frontend/dist s3://${{ secrets.S3_BUCKET_NAME }} --delete
+        else
+          echo "S3_BUCKET_NAME not configured, skipping frontend deployment"
+        fi
+
+    - name: Invalidate CloudFront (if configured)
+      run: |
+        if [ -n "${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }}" ]; then
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }} \
+            --paths "/*"
+        else
+          echo "CLOUDFRONT_DISTRIBUTION_ID not configured, skipping invalidation"
+        fi
+
+    - name: Run database migrations
+      run: |
+        # Get the database URL from Terraform output
+        DB_ENDPOINT=$(cd terraform && terraform output -raw database_endpoint)
+        export DATABASE_URL="postgresql://${{ secrets.DB_USERNAME }}:${{ secrets.DB_PASSWORD }}@${DB_ENDPOINT}/cloud_optimizer"
+        
+        # Run migrations
+        cd backend && npm run migrate
+
+  # Notification job - runs after deployment
+  notify:
+    runs-on: ubuntu-latest
+    needs: [deploy]
+    if: always() && github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Notify deployment status
+      uses: 8398a7/action-slack@v3
+      with:
+        status: ${{ needs.deploy.result }}
+        channel: '#deployments'
+        text: |
+          Cloud Cost Optimizer deployment ${{ needs.deploy.result }}
+          Branch: ${{ github.ref }}
+          Commit: ${{ github.sha }}
+          Author: ${{ github.actor }}
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      if: env.SLACK_WEBHOOK_URL != ''
